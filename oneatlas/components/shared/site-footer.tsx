@@ -1,5 +1,5 @@
 import Link from "next/link";
-
+import { Heart } from "lucide-react";
 import { Logo } from "@/components/shared/logo";
 import { NAV } from "@/lib/constants/features";
 
@@ -36,8 +36,10 @@ export function SiteFooter() {
       </div>
       <div className="border-t">
         <div className="container-page flex flex-col gap-1 py-4 text-xs text-muted-foreground sm:flex-row sm:justify-between">
-          <span>© {new Date().getFullYear()} OneAtlas — internship project build.</span>
-          <span>Pricing and benchmark figures are only shown as verified when a source is recorded.</span>
+          <span className="inline-flex flex-wrap items-center gap-1">
+  © {new Date().getFullYear()} OneAtlas. Built with <Heart aria-label="love" className="size-3.5 fill-red-500 text-red-500" /> by Harsh Vardhan Maurya
+</span>
+<span>Pricing and benchmark figures are only shown as verified when a source is recorded.</span>
         </div>
       </div>
     </footer>
