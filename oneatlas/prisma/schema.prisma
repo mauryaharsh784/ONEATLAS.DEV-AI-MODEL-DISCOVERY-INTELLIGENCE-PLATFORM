@@ -1,0 +1,623 @@
+// OneAtlas data model — PostgreSQL is the single source of truth.
+//
+// Conventions
+//  * Prices are USD per 1M tokens unless a column name says otherwise (Decimal, never Float).
+//  * Every record that can come from outside carries provenance: `source`, `sourceUrl`,
+//    `isSimulated`. `isSimulated = true` means SAMPLE data that must be labelled in the UI.
+//  * Denormalised "summary" columns on Model (list prices, providerCount, popularityScore)
+//    exist only to make catalog filtering/sorting cheap. They are derived values, recomputed
+//    by the service layer (Phase 2) whenever listings or prices change.
+//  * Rules that Prisma cannot express (2–5 models per Comparison, one current price per
+//    listing+tier, trigram search indexes) are enforced in the service layer / raw SQL
+//    in migrations and are called out where relevant.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────────── Enums ─────────────────────────────
+
+enum Role {
+  USER
+  ADMIN
+}
+
+/// Output kind of a model. Mirrors the type filter on oneatlas.dev.
+enum ModelType {
+  TEXT
+  IMAGE
+  EMBEDDING
+  VIDEO
+  SPEECH
+  TRANSCRIPTION
+  RERANKING
+  REALTIME
+}
+
+enum ModelStatus {
+  ACTIVE
+  PREVIEW
+  DEPRECATED
+}
+
+enum Modality {
+  TEXT
+  IMAGE
+  AUDIO
+  VIDEO
+  FILE
+}
+
+/// Where a record came from. SAMPLE = hand-authored demo data, never "verified".
+enum DataSource {
+  OPENROUTER
+  LITELLM
+  HUGGING_FACE
+  OFFICIAL_DOCS
+  MANUAL
+  SAMPLE
+}
+
+enum ProviderType {
+  FIRST_PARTY
+  CLOUD_PLATFORM
+  INFERENCE_HOST
+  GATEWAY
+}
+
+enum AvailabilityStatus {
+  AVAILABLE
+  LIMITED
+  DEPRECATED
+  UNAVAILABLE
+}
+
+enum PricingTier {
+  STANDARD
+  LONG_CONTEXT
+  FAST
+  PRO
+  BATCH
+}
+
+enum BenchmarkCategory {
+  INTELLIGENCE
+  CODING
+  REASONING
+  VISION
+  AGENTIC
+  PERFORMANCE
+  KNOWLEDGE
+  MATH
+  ARENA
+}
+
+/// Yes / No / Unknown — provider docs frequently leave a feature undocumented.
+enum SupportLevel {
+  YES
+  NO
+  UNKNOWN
+}
+
+enum ReleaseKind {
+  INITIAL
+  UPDATE
+  PRICE_CHANGE
+  DEPRECATION
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  IMPORT
+  ROLE_CHANGE
+  DISABLE
+  LOGIN
+}
+
+enum IngestionStatus {
+  RUNNING
+  SUCCEEDED
+  PARTIAL
+  FAILED
+}
+
+// ───────────────────────────── Identity ─────────────────────────────
+
+model User {
+  id           String    @id @default(cuid())
+  name         String?
+  email        String    @unique
+  emailVerified DateTime?
+  /// bcrypt/argon2 hash. Null for future OAuth-only accounts. Never selected into API responses.
+  passwordHash String?
+  image        String?
+  role         Role      @default(USER)
+  isActive     Boolean   @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  favorites      Favorite[]
+  collections    Collection[]
+  comparisons    Comparison[]
+  modelViews     ModelView[]
+  auditLogs      AuditLog[]
+  apiUsages      ApiUsage[]
+  ingestionRuns  IngestionRun[]
+
+  @@index([role])
+  @@index([createdAt])
+}
+
+// ───────────────────────────── Catalog ─────────────────────────────
+
+/// An AI lab / model author (OpenAI, Anthropic, Google …).
+model Lab {
+  id            String     @id @default(cuid())
+  slug          String     @unique
+  name          String
+  description   String?
+  websiteUrl    String?
+  docsUrl       String?
+  logoUrl       String?
+  headquarters  String?
+  foundedYear   Int?
+  source        DataSource @default(MANUAL)
+  sourceUrl     String?
+  isSimulated   Boolean    @default(false)
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  models Model[]
+
+  @@index([name])
+}
+
+/// A company that serves models over an API (first-party, cloud, inference host, gateway).
+model Provider {
+  id            String       @id @default(cuid())
+  slug          String       @unique
+  name          String
+  type          ProviderType @default(INFERENCE_HOST)
+  description   String?
+  websiteUrl    String?
+  docsUrl       String?
+  apiBaseUrl    String?
+  statusPageUrl String?
+  logoUrl       String?
+  /// Regions / availability notes, e.g. ["us", "eu"]. Free-form, informational.
+  regions       String[]
+  source        DataSource   @default(MANUAL)
+  sourceUrl     String?
+  isSimulated   Boolean      @default(false)
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  listings ModelProvider[]
+
+  @@index([name])
+  @@index([type])
+}
+
+/// A model, independent of who serves it.
+model Model {
+  id          String      @id @default(cuid())
+  /// Public identifier, "<lab-slug>/<model-slug>". Used in URLs and code samples.
+  canonicalId String      @unique
+  slug        String
+  name        String
+  description String?
+  family      String?
+  type        ModelType   @default(TEXT)
+  status      ModelStatus @default(ACTIVE)
+  labId       String
+
+  releaseDate     DateTime? @db.Date
+  knowledgeCutoff DateTime? @db.Date
+
+  contextWindow   Int?
+  maxInputTokens  Int?
+  maxOutputTokens Int?
+  inputModalities  Modality[]
+  outputModalities Modality[]
+
+  openWeights   Boolean @default(false)
+  license       String?
+  tokenizer     String?
+  huggingFaceId String?
+  docsUrl       String?
+  websiteUrl    String?
+  logoUrl       String?
+  /// API parameters the model accepts (tools, tool_choice, response_format, …).
+  supportedParameters String[]
+
+  // ── derived summary columns (see header note) ──
+  listInputPricePerMTok     Decimal? @db.Decimal(18, 8)
+  listOutputPricePerMTok    Decimal? @db.Decimal(18, 8)
+  listCacheReadPricePerMTok Decimal? @db.Decimal(18, 8)
+  isFree          Boolean @default(false)
+  providerCount   Int     @default(0)
+  viewCount       Int     @default(0)
+  favoriteCount   Int     @default(0)
+  popularityScore Float   @default(0)
+
+  // ── provenance ──
+  source          DataSource @default(MANUAL)
+  sourceUrl       String?
+  sourceUpdatedAt DateTime?
+  isSimulated     Boolean    @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  lab             Lab               @relation(fields: [labId], references: [id], onDelete: Restrict)
+  listings        ModelProvider[]
+  benchmarks      ModelBenchmark[]
+  capabilities    ModelCapability[]
+  favorites       Favorite[]
+  collectionItems CollectionModel[]
+  comparisonItems ComparisonModel[]
+  releases        ModelRelease[]
+  views           ModelView[]
+  apiUsages       ApiUsage[]
+
+  @@unique([labId, slug])
+  @@index([labId])
+  @@index([type, status])
+  @@index([releaseDate(sort: Desc)])
+  @@index([contextWindow])
+  @@index([listInputPricePerMTok])
+  @@index([listOutputPricePerMTok])
+  @@index([openWeights])
+  @@index([isFree])
+  @@index([popularityScore(sort: Desc)])
+  @@index([name])
+  @@index([inputModalities], type: Gin)
+  @@index([outputModalities], type: Gin)
+}
+
+/// One provider's listing of one model. A provider may list the same model under several
+/// provider-specific IDs (regional / "global." variants), so uniqueness is (provider, providerModelId).
+model ModelProvider {
+  id              String   @id @default(cuid())
+  modelId         String
+  providerId      String
+  /// The ID to put in the API request for THIS provider, e.g. "us.openai.gpt-6.1-terra".
+  providerModelId String
+  region          String?
+  availability    AvailabilityStatus @default(AVAILABLE)
+  /// True when the provider is the model's own lab.
+  isFirstParty    Boolean  @default(false)
+  contextWindow   Int?
+  maxInputTokens  Int?
+  maxOutputTokens Int?
+  /// Provider-specific feature flags with tri-state values, e.g. {"structuredOutput":"unknown"}.
+  features        Json?
+  docsUrl         String?
+  firstListedAt   DateTime?
+  lastVerifiedAt  DateTime?
+
+  source      DataSource @default(MANUAL)
+  sourceUrl   String?
+  isSimulated Boolean    @default(false)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  model    Model     @relation(fields: [modelId], references: [id], onDelete: Cascade)
+  provider Provider  @relation(fields: [providerId], references: [id], onDelete: Restrict)
+  pricing  Pricing[]
+
+  @@unique([providerId, providerModelId])
+  @@index([modelId])
+  @@index([providerId])
+  @@index([availability])
+}
+
+/// Price of one listing in one tier. History is kept: the current price has effectiveTo = NULL.
+/// Service-layer / raw-SQL rule: at most one row per (modelProviderId, tier) with effectiveTo IS NULL.
+model Pricing {
+  id              String      @id @default(cuid())
+  modelProviderId String
+  tier            PricingTier @default(STANDARD)
+  /// For LONG_CONTEXT: the prompt size (tokens) above which this tier applies.
+  contextThreshold Int?
+  currency        String      @default("USD")
+  inputPerMTok       Decimal? @db.Decimal(18, 8)
+  outputPerMTok      Decimal? @db.Decimal(18, 8)
+  cacheReadPerMTok   Decimal? @db.Decimal(18, 8)
+  cacheWritePerMTok  Decimal? @db.Decimal(18, 8)
+  reasoningPerMTok   Decimal? @db.Decimal(18, 8)
+  audioInPerMTok     Decimal? @db.Decimal(18, 8)
+  audioOutPerMTok    Decimal? @db.Decimal(18, 8)
+  webSearchPerRequest Decimal? @db.Decimal(18, 8)
+  isFree          Boolean     @default(false)
+  effectiveFrom   DateTime    @default(now())
+  effectiveTo     DateTime?
+
+  source      DataSource @default(MANUAL)
+  sourceUrl   String?
+  verifiedAt  DateTime?
+  isSimulated Boolean    @default(false)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  modelProvider ModelProvider @relation(fields: [modelProviderId], references: [id], onDelete: Cascade)
+
+  @@unique([modelProviderId, tier, effectiveFrom])
+  @@index([modelProviderId, tier])
+  @@index([inputPerMTok])
+  @@index([outputPerMTok])
+  @@index([isFree])
+}
+
+/// Definition of a benchmark / leaderboard metric.
+model Benchmark {
+  id             String            @id @default(cuid())
+  slug           String            @unique
+  name           String
+  category       BenchmarkCategory
+  description    String?
+  /// How the score is produced / evaluated (shown on benchmark pages).
+  methodology    String?
+  unit           String?
+  scaleMin       Decimal?          @db.Decimal(10, 4)
+  scaleMax       Decimal?          @db.Decimal(10, 4)
+  higherIsBetter Boolean           @default(true)
+  sourceName     String?
+  sourceUrl      String?
+  methodologyUrl String?
+  source         DataSource        @default(MANUAL)
+  isSimulated    Boolean           @default(false)
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  scores ModelBenchmark[]
+
+  @@index([category])
+}
+
+/// A model's score on a benchmark. `isSimulated` rows are sample data and must be badged in the UI.
+model ModelBenchmark {
+  id          String    @id @default(cuid())
+  modelId     String
+  benchmarkId String
+  score       Decimal   @db.Decimal(10, 4)
+  rank        Int?
+  sampleSize  Int?
+  measuredAt  DateTime?
+  sourceUrl   String?
+  notes       String?
+  verifiedAt  DateTime?
+  source      DataSource @default(MANUAL)
+  isSimulated Boolean    @default(false)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  model     Model     @relation(fields: [modelId], references: [id], onDelete: Cascade)
+  benchmark Benchmark @relation(fields: [benchmarkId], references: [id], onDelete: Cascade)
+
+  @@unique([modelId, benchmarkId])
+  @@index([benchmarkId, score(sort: Desc)])
+  @@index([modelId])
+}
+
+/// A feature a model may support (reasoning, vision, tool_calling, structured_output …).
+/// This table is the single source of truth for feature flags; Model carries no duplicate booleans.
+model Capability {
+  id           String   @id @default(cuid())
+  key          String   @unique
+  name         String
+  description  String?
+  sortOrder    Int      @default(0)
+  isFilterable Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  models ModelCapability[]
+}
+
+model ModelCapability {
+  modelId      String
+  capabilityId String
+  support      SupportLevel @default(YES)
+  /// Extra detail, e.g. {"efforts":["low","medium","high"]} for reasoning.
+  details      Json?
+  source       DataSource   @default(MANUAL)
+  isSimulated  Boolean      @default(false)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  model      Model      @relation(fields: [modelId], references: [id], onDelete: Cascade)
+  capability Capability @relation(fields: [capabilityId], references: [id], onDelete: Cascade)
+
+  @@id([modelId, capabilityId])
+  @@index([capabilityId, support])
+}
+
+/// Release / change history used for "recently released", releases-per-month and activity feeds.
+model ModelRelease {
+  id          String      @id @default(cuid())
+  modelId     String
+  kind        ReleaseKind @default(INITIAL)
+  version     String?
+  title       String
+  summary     String?
+  url         String?
+  releasedAt  DateTime
+  source      DataSource  @default(MANUAL)
+  isSimulated Boolean     @default(false)
+  createdAt   DateTime    @default(now())
+
+  model Model @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  @@index([releasedAt(sort: Desc)])
+  @@index([modelId, releasedAt(sort: Desc)])
+}
+
+// ───────────────────────────── User data ─────────────────────────────
+
+/// "Favorites" and "saved models" are the same concept: one row per (user, model).
+model Favorite {
+  userId    String
+  modelId   String
+  createdAt DateTime @default(now())
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  model Model @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  @@id([userId, modelId])
+  @@index([modelId])
+  @@index([userId, createdAt(sort: Desc)])
+}
+
+model Collection {
+  id          String   @id @default(cuid())
+  userId      String
+  name        String
+  description String?
+  isPublic    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  user   User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  models CollectionModel[]
+
+  @@unique([userId, name])
+  @@index([userId])
+}
+
+model CollectionModel {
+  collectionId String
+  modelId      String
+  position     Int      @default(0)
+  note         String?
+  addedAt      DateTime @default(now())
+
+  collection Collection @relation(fields: [collectionId], references: [id], onDelete: Cascade)
+  model      Model      @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  @@id([collectionId, modelId])
+  @@index([modelId])
+}
+
+/// A shareable comparison. userId is null for anonymous links. Service layer enforces 2–5 models.
+model Comparison {
+  id        String   @id @default(cuid())
+  /// Short URL-safe token used in /compare?c=<shareSlug>.
+  shareSlug String   @unique
+  userId    String?
+  name      String?
+  isPublic  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user   User?             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  models ComparisonModel[]
+
+  @@index([userId, createdAt(sort: Desc)])
+}
+
+model ComparisonModel {
+  comparisonId String
+  modelId      String
+  position     Int
+
+  comparison Comparison @relation(fields: [comparisonId], references: [id], onDelete: Cascade)
+  model      Model      @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  @@id([comparisonId, modelId])
+  @@unique([comparisonId, position])
+  @@index([modelId])
+}
+
+/// "Recently viewed": one row per (user, model); viewedAt is bumped on every visit.
+model ModelView {
+  userId   String
+  modelId  String
+  viewedAt DateTime @default(now())
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  model Model @relation(fields: [modelId], references: [id], onDelete: Cascade)
+
+  @@id([userId, modelId])
+  @@index([userId, viewedAt(sort: Desc)])
+}
+
+// ───────────────────────────── Operations ─────────────────────────────
+
+/// Immutable record of admin/security-relevant actions. Survives user deletion (actorEmail snapshot).
+model AuditLog {
+  id         String      @id @default(cuid())
+  actorId    String?
+  actorEmail String?
+  action     AuditAction
+  entityType String
+  entityId   String?
+  summary    String?
+  before     Json?
+  after      Json?
+  ipHash     String?
+  userAgent  String?
+  createdAt  DateTime    @default(now())
+
+  actor User? @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([actorId, createdAt(sort: Desc)])
+  @@index([entityType, entityId])
+  @@index([createdAt(sort: Desc)])
+}
+
+/// Per-request usage record for API routes and the playground (rate-limit analytics, token usage).
+/// Named ApiUsage (not APIUsage) so the Prisma client accessor is `prisma.apiUsage`.
+model ApiUsage {
+  id               String   @id @default(cuid())
+  userId           String?
+  modelId          String?
+  endpoint         String
+  method           String
+  statusCode       Int
+  latencyMs        Int?
+  promptTokens     Int?
+  completionTokens Int?
+  /// True when the playground answered in labelled demo mode (no real provider call).
+  isDemo           Boolean  @default(false)
+  ipHash           String?
+  createdAt        DateTime @default(now())
+
+  user  User?  @relation(fields: [userId], references: [id], onDelete: SetNull)
+  model Model? @relation(fields: [modelId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([endpoint, createdAt(sort: Desc)])
+  @@index([modelId])
+}
+
+/// One run of a data ingestion adapter or an admin CSV/JSON import.
+model IngestionRun {
+  id            String          @id @default(cuid())
+  source        DataSource
+  status        IngestionStatus @default(RUNNING)
+  triggeredById String?
+  fileName      String?
+  createdCount  Int             @default(0)
+  updatedCount  Int             @default(0)
+  skippedCount  Int             @default(0)
+  failedCount   Int             @default(0)
+  errorSummary  String?
+  meta          Json?
+  startedAt     DateTime        @default(now())
+  finishedAt    DateTime?
+
+  triggeredBy User? @relation(fields: [triggeredById], references: [id], onDelete: SetNull)
+
+  @@index([source, startedAt(sort: Desc)])
+  @@index([status])
+}
