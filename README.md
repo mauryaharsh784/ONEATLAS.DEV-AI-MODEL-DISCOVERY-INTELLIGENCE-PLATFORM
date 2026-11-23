@@ -1,5 +1,7 @@
 # OneAtlas — AI model discovery & intelligence platform
 
+Live demo: https://oneatlas-dev-ai-model-discovery-int.vercel.app
+
 A full-stack Next.js app for comparing AI models, labs and API providers. **PostgreSQL (via Prisma) is the only
 data source** — every page and API reads it through a shared service layer, and every record carries provenance.
 
