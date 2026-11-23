@@ -43,7 +43,7 @@ Verify: `npm run db:check` → `http://localhost:3000/api/health` should report 
 |---|---|---|
 | Dashboard | `/` | Live stats, trending, recent, popular, category donut, releases/month, price distribution, median price by lab, cheapest tool-calling models, popular providers, featured labs, compare shortcuts, capability coverage, 6 Recharts charts |
 | Global search | header, `/` | Live dropdown (`/api/search`), ↑/↓/Enter, ⌘K or `/` to focus, groups models/labs/providers |
-| Model catalog | `/models` | Table + grid, 11 filter types in a URL-backed sidebar (mobile drawer), sortable headers + sort menu, debounced search, page size, pagination, removable filter chips, compare checkboxes |
+| Model catalog | `/models` | Redesigned (see [UI redesign](#ui-redesign)): header with live totals, table + grid views, URL-backed collapsible filter sidebar (mobile drawer) with named chips, sortable sticky-header table, debounced search, sort/page-size menus, pagination, compare checkboxes with a floating compare bar |
 | Model detail | `/models/<lab>/<slug>` | Stats strip, per-provider pricing with copyable provider model IDs and tiers, capabilities (yes/no/unknown), modalities, sample benchmark bars, specifications, related models, docs links |
 | Compare | `/compare?ids=…` | 2–5 models, search-to-add, remove, best-value highlighting, share link, floating tray from anywhere |
 | Rankings | `/rankings` | Overall / Intelligence / Coding / Reasoning / Vision / Agentic / Performance, top 10/20/50, score breakdown, chart |
@@ -54,6 +54,18 @@ Verify: `npm run db:check` → `http://localhost:3000/api/health` should report 
 
 All API responses use `{ ok, data, meta? }` / `{ ok:false, error:{code,message,details?} }`, Zod validation, central error mapping
 (unknown errors are opaque 500s), cache headers, and an in-memory rate limiter (60/min search, 120/min others).
+
+## UI redesign
+
+The Models catalog and the visual system were redesigned without changing routes, API contracts or data sources.
+
+- **Theme:** deeper near-black dark theme with an indigo/violet accent and low-contrast borders (`app/globals.css`); light theme still supported.
+- **Navbar:** compact, blurred, with an active-section indicator (`components/shared/site-nav.tsx`, `site-header.tsx`).
+- **Catalog:** `components/catalog/` — `catalog-hero`, `catalog-toolbar`, `filters-sidebar`, `models-table` (table, mobile list and card grid), `clickable-row`, `model-parts`, `compare-controls` (checkbox, button and floating tray), `icons` (capability/modality tooltips).
+- **Filter state:** `hooks/use-query-state.ts` keeps an optimistic copy of the URL, so checkboxes respond instantly and quick consecutive clicks no longer overwrite each other.
+- **Data:** list rows now include the model `description` (read-only column that already existed).
+- **Detail page:** same header band and stat strip styling as the catalog.
+- **Loading:** a catalog-shaped skeleton (`CatalogSkeleton`).
 
 ## Data — what is real and what is not
 
@@ -126,11 +138,28 @@ simulated throughput exceeding its scale; chart label collisions.
 
 Pricing page / token cost calculator, Smart Model Finder, Playground, developer docs & code samples, authentication, accounts,
 favorites / collections / saved comparisons UI, admin dashboard (CRUD, CSV/JSON import, audit log UI), Playwright suite (a
-puppeteer-based script is provided instead), Vercel/Neon deployment (**never attempted**), distributed rate limiting (the limiter
+puppeteer-based script is provided instead), distributed rate limiting (the limiter
 is per-process; use Redis/Upstash on Vercel). `npm audit` reports 3 high findings, all one ReDoS advisory in `effect`, pulled in by
 the Prisma CLI (build-time only).
 
-## Deployment (planned, not performed)
+## Deployment (Vercel + Neon)
 
-Create a Neon project → pooled string in `DATABASE_URL`, direct string in `DIRECT_URL`, `DATABASE_POOL_MAX=1..3` →
-import the repo in Vercel → run `prisma migrate deploy` and `npm run db:seed` against the direct URL.
+1. **Neon:** create a project. In *Connect*, copy two strings: pooling **on** (host contains `-pooler`) and pooling **off** (direct).
+2. **Load the database once, from your own machine** (set both variables to the *direct* string in that terminal only):
+   ```powershell
+   $env:DATABASE_URL="<neon direct string>"
+   $env:DIRECT_URL="<neon direct string>"
+   npm run db:setup
+   ```
+3. **GitHub:** push the repo (`.env` is git-ignored and must stay that way).
+4. **Vercel:** import the repo and set environment variables — values pasted **without quotes**:
+   `DATABASE_URL` = pooled string, `DIRECT_URL` = direct string, `DATABASE_POOL_MAX` = `3`, later `NEXT_PUBLIC_APP_URL` = your live URL. Redeploy after any change.
+5. **Check:** `/api/health` should report `"database":"up"`, `"migrated":true`, `"models":532`.
+
+Troubleshooting: `/api/health` OK but pages show "Something went wrong" means a server render failed; production hides the message
+(React error #441). Read the real error in Vercel → Logs (Runtime, level Error), or reproduce locally with the Neon strings set in the
+terminal (`npm run dev` prints the full error). Never paste real connection strings or passwords into chats, issues or commits; reset the
+Neon password if one leaks.
+
+---
+Built with ❤ by Harsh Vardhan Maurya.
